@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012-2019, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2012-2020, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -104,6 +104,7 @@
 #define FASTRPC_STATIC_HANDLE_MAX (20)
 #define FASTRPC_LATENCY_CTRL_ENB  (1)
 
+#define MAX_SIZE_LIMIT (0x78000000)
 #define INIT_FILELEN_MAX (2*1024*1024)
 #define INIT_MEMLEN_MAX  (8*1024*1024)
 #define MAX_CACHE_BUF_SIZE (8*1024*1024)
@@ -261,8 +262,8 @@ struct fastrpc_static_pd {
 	struct notifier_block pdrnb;
 	struct notifier_block get_service_nb;
 	void *pdrhandle;
-	int pdrcount;
-	int prevpdrcount;
+	uint64_t pdrcount;
+	uint64_t prevpdrcount;
 	int ispdup;
 	int cid;
 };
@@ -279,10 +280,10 @@ struct fastrpc_channel_ctx {
 	struct notifier_block nb;
 	struct mutex smd_mutex;
 	struct mutex rpmsg_mutex;
-	int sesscount;
-	int ssrcount;
+	uint64_t sesscount;
+	uint64_t ssrcount;
 	void *handle;
-	int prevssrcount;
+	uint64_t prevssrcount;
 	int issubsystemup;
 	int vmid;
 	struct secure_vm rhvm;
@@ -375,7 +376,7 @@ struct fastrpc_file {
 	int sessionid;
 	int tgid;
 	int cid;
-	int ssrcount;
+	uint64_t ssrcount;
 	int pd;
 	char *spdname;
 	int file_close;
@@ -900,6 +901,12 @@ static int fastrpc_mmap_create(struct fastrpc_file *fl, int fd,
 				DMA_ATTR_SKIP_CPU_SYNC;
 		else if (map->attr & FASTRPC_ATTR_COHERENT)
 			map->attach->dma_map_attrs |= DMA_ATTR_FORCE_COHERENT;
+		/*
+		 * Skip CPU sync if IO Cohernecy is not supported
+		 * as we flush later
+		 */
+		else if (!sess->smmu.coherent)
+			map->attach->dma_map_attrs |= DMA_ATTR_SKIP_CPU_SYNC;
 
 		VERIFY(err, !IS_ERR_OR_NULL(map->table =
 			dma_buf_map_attachment(map->attach,
@@ -921,6 +928,12 @@ static int fastrpc_mmap_create(struct fastrpc_file *fl, int fd,
 				map->size += sg_dma_len(sgl);
 		} else {
 			map->size = buf_page_size(len);
+		}
+
+		VERIFY(err, map->size >= len && map->size < MAX_SIZE_LIMIT);
+		if (err) {
+			err = -EFAULT;
+			goto bail;
 		}
 
 		vmid = fl->apps->channel[fl->cid].vmid;
@@ -967,9 +980,11 @@ static int fastrpc_buf_alloc(struct fastrpc_file *fl, size_t size,
 	struct fastrpc_buf *buf = NULL, *fr = NULL;
 	struct hlist_node *n;
 
-	VERIFY(err, size > 0);
-	if (err)
+	VERIFY(err, size > 0 && size < MAX_SIZE_LIMIT);
+	if (err) {
+		err = -EFAULT;
 		goto bail;
+	}
 
 	if (!remote) {
 		/* find the smallest buffer that fits in the cache */
@@ -1651,9 +1666,9 @@ static int get_args(uint32_t kernel, struct smq_invoke_ctx *ctx)
 			ctx->overps[oix]->mstart) {
 			if (map && map->buf) {
 				dma_buf_begin_cpu_access(map->buf,
-					DMA_BIDIRECTIONAL);
+					DMA_TO_DEVICE);
 				dma_buf_end_cpu_access(map->buf,
-					DMA_BIDIRECTIONAL);
+					DMA_TO_DEVICE);
 			} else
 				dmac_flush_range(uint64_to_ptr(rpra[i].buf.pv),
 					uint64_to_ptr(rpra[i].buf.pv
@@ -1810,9 +1825,9 @@ static void inv_args(struct smq_invoke_ctx *ctx)
 		}
 		if (map && map->buf) {
 			dma_buf_begin_cpu_access(map->buf,
-				DMA_BIDIRECTIONAL);
+				DMA_FROM_DEVICE);
 			dma_buf_end_cpu_access(map->buf,
-				DMA_BIDIRECTIONAL);
+				DMA_FROM_DEVICE);
 		} else
 			dmac_inv_range((char *)uint64_to_ptr(rpra[i].buf.pv),
 				(char *)uint64_to_ptr(rpra[i].buf.pv
@@ -2791,7 +2806,8 @@ static int fastrpc_session_alloc_locked(struct fastrpc_channel_ctx *chan,
 			int secure, struct fastrpc_session_ctx **session)
 {
 	struct fastrpc_apps *me = &gfa;
-	int idx = 0, err = 0;
+	uint64_t idx = 0;
+	int err = 0;
 
 	if (chan->sesscount) {
 		for (idx = 0; idx < chan->sesscount; ++idx) {
@@ -3065,13 +3081,13 @@ static ssize_t fastrpc_debugfs_read(struct file *filp, char __user *buffer,
 			len += scnprintf(fileinfo + len,
 				DEBUGFS_SIZE - len, "%-7s", chan->subsys);
 			len += scnprintf(fileinfo + len,
-				DEBUGFS_SIZE - len, "|%-10d",
+				DEBUGFS_SIZE - len, "|%-10u",
 				chan->sesscount);
 			len += scnprintf(fileinfo + len,
 				DEBUGFS_SIZE - len, "|%-14d",
 				chan->issubsystemup);
 			len += scnprintf(fileinfo + len,
-				DEBUGFS_SIZE - len, "|%-9d",
+				DEBUGFS_SIZE - len, "|%-9u",
 				chan->ssrcount);
 			for (j = 0; j < chan->sesscount; j++) {
 				sess_used += chan->session[j].used;
@@ -3127,7 +3143,7 @@ static ssize_t fastrpc_debugfs_read(struct file *filp, char __user *buffer,
 		len += scnprintf(fileinfo + len, DEBUGFS_SIZE - len,
 			"%s %7s %d\n", "sessionid", ":", fl->sessionid);
 		len += scnprintf(fileinfo + len, DEBUGFS_SIZE - len,
-			"%s %8s %d\n", "ssrcount", ":", fl->ssrcount);
+			"%s %8s %u\n", "ssrcount", ":", fl->ssrcount);
 		len += scnprintf(fileinfo + len, DEBUGFS_SIZE - len,
 			"%s %14s %d\n", "pd", ":", fl->pd);
 		len += scnprintf(fileinfo + len, DEBUGFS_SIZE - len,
@@ -3634,8 +3650,10 @@ static long fastrpc_device_ioctl(struct file *file, unsigned int ioctl_num,
 			mutex_unlock(&fl->perf_mutex);
 
 			if (fperf) {
-				K_COPY_TO_USER(err, 0, (void *)p.perf.data,
-					fperf, sizeof(*fperf));
+				K_COPY_TO_USER(err, 0,
+					(void *)p.perf.data, fperf,
+					sizeof(*fperf) -
+					sizeof(struct hlist_node));
 			}
 		}
 		K_COPY_TO_USER(err, 0, param, &p.perf, sizeof(p.perf));
@@ -3832,8 +3850,8 @@ static int fastrpc_cb_probe(struct device *dev)
 	struct of_phandle_args iommuspec;
 	const char *name;
 	dma_addr_t start = 0x80000000;
-	int err = 0;
-	unsigned int sharedcb_count = 0, cid, i, j;
+	int err = 0, cid = -1, i = 0;
+	u32 sharedcb_count = 0, j = 0;
 	unsigned int index, num_indices = 0;
 	int secure_vmid = VMID_CP_PIXEL, cache_flush = 1;
 
@@ -3887,7 +3905,7 @@ static int fastrpc_cb_probe(struct device *dev)
 		start = 0x60000000;
 	VERIFY(err, !IS_ERR_OR_NULL(sess->smmu.mapping =
 				arm_iommu_create_mapping(&platform_bus_type,
-						start, 0x78000000)));
+						start, MAX_SIZE_LIMIT)));
 	if (err) {
 		pr_err("adsprpc: %s: creating iommu mapping failed for %s, ret %pK",
 				__func__, dev_name(dev), sess->smmu.mapping);

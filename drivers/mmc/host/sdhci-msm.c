@@ -1203,7 +1203,7 @@ void sdhci_msm_set_mmc_drv_type(struct sdhci_host *host, u32 opcode,
 int sdhci_msm_execute_tuning(struct sdhci_host *host, u32 opcode)
 {
 	unsigned long flags;
-	int tuning_seq_cnt = 3;
+	int tuning_seq_cnt = 10;
 	u8 phase, *data_buf, tuned_phases[NUM_TUNING_PHASES], tuned_phase_cnt;
 	const u32 *tuning_block_pattern = tuning_block_64;
 	int size = sizeof(tuning_block_64); /* Tuning pattern size in bytes */
@@ -1399,6 +1399,22 @@ retry:
 		sdhci_msm_set_mmc_drv_type(host, opcode, 0);
 
 	if (tuned_phase_cnt) {
+		if (tuned_phase_cnt == ARRAY_SIZE(tuned_phases)) {
+			/*
+			 * All phases valid is _almost_ as bad as no phases
+			 * valid.  Probably all phases are not really reliable
+			 * but we didn't detect where the unreliable place is.
+			 * That means we'll essentially be guessing and hoping
+			 * we get a good phase.  Better to try a few times.
+			 */
+			dev_dbg(mmc_dev(mmc), "%s: All phases valid; try again\n",
+				mmc_hostname(mmc));
+			if (--tuning_seq_cnt) {
+				tuned_phase_cnt = 0;
+				goto retry;
+			}
+		}
+
 		rc = msm_find_most_appropriate_phase(host, tuned_phases,
 							tuned_phase_cnt);
 		if (rc < 0)
@@ -5064,6 +5080,7 @@ static int sdhci_msm_probe(struct platform_device *pdev)
 	host->quirks |= SDHCI_QUIRK_SINGLE_POWER_WRITE;
 	host->quirks |= SDHCI_QUIRK_CAP_CLOCK_BASE_BROKEN;
 	host->quirks |= SDHCI_QUIRK_NO_ENDATTR_IN_NOPDESC;
+	host->quirks |= SDHCI_QUIRK_MULTIBLOCK_READ_ACMD12;
 	host->quirks2 |= SDHCI_QUIRK2_ALWAYS_USE_BASE_CLOCK;
 	host->quirks2 |= SDHCI_QUIRK2_IGNORE_DATATOUT_FOR_R1BCMD;
 	host->quirks2 |= SDHCI_QUIRK2_BROKEN_PRESET_VALUE;
@@ -5224,6 +5241,13 @@ static int sdhci_msm_probe(struct platform_device *pdev)
 		dev_err(&pdev->dev, "Add host failed (%d)\n", ret);
 		goto vreg_deinit;
 	}
+
+	/*
+	 * To avoid polling and to avoid this R1b command conversion
+	 * to R1 command if the requested busy timeout > host's max
+	 * busy timeout in case of sanitize, erase or any R1b command
+	 */
+	host->mmc->max_busy_timeout = 0;
 
 	msm_host->pltfm_init_done = true;
 
